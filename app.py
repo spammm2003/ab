@@ -1,110 +1,52 @@
 import re
-import io
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
 
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import plotly.express as px
 from bs4 import BeautifulSoup
 from lxml import etree
 
 st.set_page_config(page_title="Компанія під мікроскопом", page_icon="🔎", layout="wide")
 
 SMIDA_FEED_URL = "https://smida.gov.ua/db/api/v1/feed-index.xml"
-YOUCONTROL_SEARCH_URL = "https://youcontrol.com.ua/search/?q={query}"
-YOUCONTROL_COMPANY_URL = "https://youcontrol.com.ua/catalog/company_details/{edrpou}/"
 REQUEST_TIMEOUT = 25
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+    )
 }
 
 
-# -----------------------------
+# ---------------------------------
 # Допоміжні функції
-# -----------------------------
-def normalize_company_name(name: str) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"\s+", " ", name)
-    return name
-
-
+# ---------------------------------
 def safe_get(url: str, params: Optional[dict] = None) -> requests.Response:
     response = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     return response
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def search_youcontrol_company(query: str) -> Dict:
-    """
-    Пошук компанії через публічну пошукову сторінку YouControl.
-    Повертає перший знайдений ЄДРПОУ, якщо він є в HTML.
-    """
-    query = normalize_company_name(query)
-    url = YOUCONTROL_SEARCH_URL.format(query=quote(query))
 
-    try:
-        resp = safe_get(url)
-        html = resp.text
-
-        # Шукаємо перший company_details/<edrpou>
-        match = re.search(r"company_details/(\d{8,10})/", html)
-        if match:
-            edrpou = match.group(1)
-            return {
-                "query": query,
-                "edrpou": edrpou,
-                "search_url": url,
-                "company_url": YOUCONTROL_COMPANY_URL.format(edrpou=edrpou),
-                "source": "YouControl search",
-            }
-
-        # fallback: спроба знайти код на сторінці
-        code_match = re.search(r"Код\s+ЄДРПОУ\s*</?[^>]*>\s*(\d{8,10})", html, flags=re.IGNORECASE)
-        if code_match:
-            edrpou = code_match.group(1)
-            return {
-                "query": query,
-                "edrpou": edrpou,
-                "search_url": url,
-                "company_url": YOUCONTROL_COMPANY_URL.format(edrpou=edrpou),
-                "source": "YouControl search",
-            }
-
-        return {
-            "query": query,
-            "edrpou": None,
-            "search_url": url,
-            "company_url": None,
-            "source": "YouControl search",
-            "error": "Компанію не знайдено на публічній сторінці пошуку YouControl.",
-        }
-    except Exception as e:
-        return {
-            "query": query,
-            "edrpou": None,
-            "search_url": url,
-            "company_url": None,
-            "source": "YouControl search",
-            "error": f"Помилка пошуку YouControl: {e}",
-        }
+def extract_edrpou(user_input: str) -> Optional[str]:
+    s = str(user_input).strip()
+    match = re.fullmatch(r"\d{8,10}", s)
+    if match:
+        return match.group(0)
+    return None
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_smida_reports_by_edrpou(edrpou: str, limit: int = 300) -> pd.DataFrame:
     params = {
         "edrpou": edrpou,
-        "period": "y",  # річні звіти
+        "period": "y",
         "limit": limit,
     }
 
     response = safe_get(SMIDA_FEED_URL, params=params)
-    xml_bytes = response.content
-    root = etree.fromstring(xml_bytes)
+    root = etree.fromstring(response.content)
 
     items = []
     for item in root.findall(".//item"):
@@ -118,7 +60,6 @@ def get_smida_reports_by_edrpou(edrpou: str, limit: int = 300) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # типові поля в feed-index.xml
     rename_map = {
         "title": "title",
         "link": "link",
@@ -138,10 +79,8 @@ def get_smida_reports_by_edrpou(edrpou: str, limit: int = 300) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    if "title" in df.columns:
-        df["title"] = df["title"].astype(str)
-
     return df
+
 
 
 def choose_latest_company_name(df: pd.DataFrame, fallback: str) -> str:
@@ -153,21 +92,31 @@ def choose_latest_company_name(df: pd.DataFrame, fallback: str) -> str:
     return values.iloc[0]
 
 
+
 def extract_report_links(df: pd.DataFrame) -> List[str]:
-    if df.empty:
+    if df.empty or "link" not in df.columns:
         return []
-    links = []
-    if "link" in df.columns:
-        links.extend(df["link"].dropna().astype(str).tolist())
-    return [x for x in links if x.startswith("http")]
+    return [x for x in df["link"].dropna().astype(str).tolist() if x.startswith("http")]
+
+
+
+def parse_number(value) -> Optional[float]:
+    if value is None:
+        return None
+    s = str(value).strip().replace("\xa0", " ")
+    s = s.replace(" ", "")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s in {"", ".", "-", "-."}:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def parse_financials_from_report_page(url: str) -> List[Dict]:
-    """
-    Універсальний парсер HTML-таблиць зі сторінки звіту.
-    Шукає типові фінансові показники за ключовими словами.
-    """
     keywords = {
         "Чистий дохід": ["чистий дохід", "дохід від реалізації", "net revenue"],
         "Чистий прибуток": ["чистий прибуток", "чистий збиток", "net profit"],
@@ -191,6 +140,7 @@ def parse_financials_from_report_page(url: str) -> List[Dict]:
                 cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
                 if len(cells) < 2:
                     continue
+
                 row_text = " ".join(cells).lower()
                 for metric_name, variants in keywords.items():
                     if any(v in row_text for v in variants):
@@ -198,34 +148,22 @@ def parse_financials_from_report_page(url: str) -> List[Dict]:
                         for c in cells[1:]:
                             found = re.findall(r"-?\d[\d\s,.]*", c)
                             numbers.extend(found)
+
                         value = None
                         if numbers:
                             value = parse_number(numbers[-1])
+
                         if value is not None:
-                            results.append({
-                                "metric": metric_name,
-                                "value": value,
-                                "source_url": url,
-                            })
+                            results.append(
+                                {
+                                    "metric": metric_name,
+                                    "value": value,
+                                    "source_url": url,
+                                }
+                            )
         return results
     except Exception:
         return []
-
-
-
-def parse_number(value) -> Optional[float]:
-    if value is None:
-        return None
-    s = str(value).strip().replace("\xa0", " ")
-    s = s.replace(" ", "")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9.\-]", "", s)
-    if s in {"", ".", "-", "-."}:
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
 
 
 
@@ -241,8 +179,6 @@ def build_financial_dataframe(report_df: pd.DataFrame, max_reports_to_scan: int 
 
     fin_df = pd.DataFrame(collected)
     fin_df = fin_df.dropna(subset=["metric", "value"])
-
-    # беремо останнє значення по кожному показнику
     fin_df = fin_df.groupby("metric", as_index=False).agg({"value": "last", "source_url": "last"})
     return fin_df
 
@@ -281,7 +217,7 @@ def calculate_risk_score(fin_df: pd.DataFrame) -> Tuple[int, str, List[str], Dic
 
     if ratios["Борг/Активи"] is not None and ratios["Борг/Активи"] > 0.8:
         score += 20
-        reasons.append("Висока боргове навантаження відносно активів.")
+        reasons.append("Високе боргове навантаження відносно активів.")
 
     if ratios["Поточна ліквідність"] is not None and ratios["Поточна ліквідність"] < 1:
         score += 15
@@ -312,61 +248,55 @@ def format_money(x: Optional[float]) -> str:
     return f"{x:,.2f}".replace(",", " ")
 
 
-# -----------------------------
+# ---------------------------------
 # UI
-# -----------------------------
+# ---------------------------------
 st.title("🔎 OSINT-додаток: Компанія під мікроскопом")
-st.caption("Пошук компанії, збір даних із відкритих джерел, DataFrame, графіки та оцінка ризику.")
+st.caption("Пошук компанії за ЄДРПОУ, збір даних із SMIDA, DataFrame, графіки та оцінка ризику.")
 
 with st.sidebar:
     st.header("Налаштування")
-    company_query = st.text_input("Назва компанії", placeholder="Наприклад: ПриватБанк")
+    company_query = st.text_input(
+        "ЄДРПОУ компанії",
+        placeholder="Наприклад: 14360570",
+    )
     max_reports = st.slider("Скільки SMIDA-звітів аналізувати", 3, 30, 12)
     run_btn = st.button("Запустити аналіз", type="primary")
 
 st.markdown(
     """
-    **Джерела:**
-    - **SMIDA**: офіційний API відкритих даних.
-    - **YouControl demo / public pages**: публічний пошук компаній та демо-досьє.
+**Джерела:**
+- **SMIDA**: офіційний API відкритих даних.
+- Автоматичний пошук через сторонні сайти може блокуватися захистом від ботів, тому тут використовується лише ЄДРПОУ.
 
-    > Примітка: структура HTML-сторінок може змінюватися. Якщо SMIDA/YouControl змінять верстку,
-    > парсер може потребувати оновлення.
-    """
+> Примітка: структура HTML-сторінок звітів може змінюватися. Якщо SMIDA змінить верстку,
+> парсер фінансових таблиць може потребувати оновлення.
+"""
 )
 
 if run_btn:
-    if not company_query.strip():
-        st.warning("Введіть назву компанії.")
-        st.stop()
+    edrpou = extract_edrpou(company_query)
 
-    with st.spinner("Шукаю компанію в YouControl..."):
-        yc = search_youcontrol_company(company_query)
-
-    if yc.get("error"):
-        st.error(yc["error"])
-        st.stop()
-
-    edrpou = yc.get("edrpou")
     if not edrpou:
-        st.error("Не вдалося визначити ЄДРПОУ компанії.")
+        st.error("Введіть коректний ЄДРПОУ: 8–10 цифр без пробілів.")
         st.stop()
-
-    st.success(f"Знайдено ЄДРПОУ: {edrpou}")
 
     with st.spinner("Отримую річні звіти з SMIDA..."):
-        report_df = get_smida_reports_by_edrpou(edrpou)
+        try:
+            report_df = get_smida_reports_by_edrpou(edrpou)
+        except Exception as e:
+            st.error(f"Помилка запиту до SMIDA: {e}")
+            st.stop()
 
-    company_name = choose_latest_company_name(report_df, company_query)
+    company_name = choose_latest_company_name(report_df, edrpou)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     col1.metric("Компанія", company_name)
     col2.metric("ЄДРПОУ", edrpou)
-    col3.markdown(f"[Відкрити досьє YouControl]({yc['company_url']})")
 
     st.subheader("1) Реєстр звітів SMIDA")
     if report_df.empty:
-        st.warning("SMIDA не повернула звітів для цієї компанії.")
+        st.warning("SMIDA не повернула звітів для цього ЄДРПОУ.")
     else:
         view_cols = [c for c in ["title", "pub_date", "period_start", "period_end", "link"] if c in report_df.columns]
         st.dataframe(report_df[view_cols], use_container_width=True)
@@ -385,7 +315,7 @@ if run_btn:
     if fin_df.empty:
         st.warning(
             "Не вдалося автоматично витягнути фінансові показники зі сторінок звітів. "
-            "Це нормально для частини емітентів: структура звітів може відрізнятися."
+            "Це нормально: структура звітів у різних компаній може відрізнятися."
         )
     else:
         fin_df_display = fin_df.copy()
@@ -401,14 +331,13 @@ if run_btn:
         )
 
         chart_df = fin_df.copy().sort_values("value", ascending=False)
-        fig_bar = px.bar(chart_df, x="metric", y="value", title="Ключові фінансові показники")
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.markdown("**Графік ключових фінансових показників**")
+        st.bar_chart(chart_df.set_index("metric")["value"], use_container_width=True)
 
-        positive_df = chart_df.copy()
-        positive_df = positive_df[positive_df["value"] > 0]
+        positive_df = chart_df[chart_df["value"] > 0].copy()
         if not positive_df.empty:
-            fig_pie = px.pie(positive_df, names="metric", values="value", title="Структура позитивних показників")
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.markdown("**Позитивні показники**")
+            st.dataframe(positive_df[["metric", "value"]], use_container_width=True)
 
         score, level, reasons, ratios = calculate_risk_score(fin_df)
 
@@ -417,10 +346,9 @@ if run_btn:
         risk_col1.metric("Risk score", score)
         risk_col2.metric("Рівень ризику", level)
 
-        ratio_df = pd.DataFrame(
-            [{"ratio": k, "value": v} for k, v in ratios.items()]
-        )
+        ratio_df = pd.DataFrame([{"ratio": k, "value": v} for k, v in ratios.items()])
         ratio_df["formatted"] = ratio_df["value"].apply(lambda x: "—" if x is None else f"{x:.2f}")
+
         st.markdown("**Розраховані коефіцієнти:**")
         st.dataframe(ratio_df[["ratio", "formatted"]], use_container_width=True)
 
@@ -434,26 +362,34 @@ if run_btn:
         st.subheader("4) Висновок")
         st.info(
             f"За доступними відкритими даними компанія **{company_name}** має рівень ризику: **{level}**. "
-            f"Оцінка базується на доступних показниках зі звітності SMIDA та відкритій інформації з YouControl."
+            f"Оцінка базується на доступних показниках зі звітності SMIDA."
         )
-
 else:
-    st.info("Введіть назву компанії в лівій панелі та натисніть 'Запустити аналіз'.")
+    st.info("Введіть ЄДРПОУ в лівій панелі та натисніть 'Запустити аналіз'.")
 
     st.markdown(
         """
-        ### Що робить цей застосунок
-        1. Приймає назву компанії.
-        2. Через публічний пошук YouControl намагається знайти ЄДРПОУ.
-        3. Через API SMIDA отримує список річних звітів.
-        4. Складає результати у `pandas.DataFrame`.
-        5. Будує таблиці та графіки.
-        6. Обчислює сукупний ризиковий бал.
+### Що робить цей застосунок
+1. Приймає ЄДРПОУ компанії.
+2. Через API SMIDA отримує список річних звітів.
+3. Складає результати у `pandas.DataFrame`.
+4. Автоматично намагається витягнути фінансові показники зі сторінок звітів.
+5. Будує таблиці та графік.
+6. Обчислює сукупний ризиковий бал.
 
-        ### Запуск локально
-        ```bash
-        pip install streamlit pandas requests beautifulsoup4 lxml plotly numpy
-        streamlit run streamlit_osint_app.py
-        ```
-        """
-    )
+### Запуск локально
+```bash
+pip install streamlit pandas requests beautifulsoup4 lxml
+streamlit run app.py
+```
+
+### requirements.txt
+```txt
+streamlit
+pandas
+requests
+beautifulsoup4
+lxml
+```
+"""
+)
